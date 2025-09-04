@@ -1825,6 +1825,7 @@ struct queue_ent {
 	int valid_digits;                      /*!< Digits entered correspond to valid extension. Exited */
 	int pos;                               /*!< Where we are in the queue */
 	int prio;                              /*!< Our priority */
+	int last_hold_said;                    /*!< Last hold time we told the user */
 	int last_pos_said;                     /*!< Last position we told the user */
 	int ring_when_ringing;                 /*!< Should we only use ring indication when a channel is ringing? */
 	time_t last_periodic_announce_time;    /*!< The last time we played a periodic announcement */
@@ -1897,7 +1898,9 @@ enum member_properties {
 /* values used in multi-bit flags in call_queue */
 #define ANNOUNCEHOLDTIME_ALWAYS 1
 #define ANNOUNCEHOLDTIME_ONCE 2
-#define QUEUE_EVENT_VARIABLES 3
+#define ANNOUNCEHOLDTIME_MORE_THAN 3 /*!< We say "Currently there are more than <holdtime>" TODO */
+#define ANNOUNCEHOLDTIME_LIMIT 4 /*!< We not announce position more than \<holdtime\> TODO */
+#define QUEUE_EVENT_VARIABLES 5 // ????
 
 struct penalty_rule {
 	int time;                           /*!< Number of seconds that need to pass before applying this rule */
@@ -1942,6 +1945,8 @@ struct call_queue {
 		AST_STRING_FIELD(queue_quantity2);
 		/*! Sound file: "The current estimated total holdtime is" (def. queue-holdtime) */
 		AST_STRING_FIELD(sound_holdtime);
+		/*! Sound file: "more than" (def. queue-morethan) */
+		AST_STRING_FIELD(sound_morethan);
 		/*! Sound file: "minutes." (def. queue-minutes) */
 		AST_STRING_FIELD(sound_minutes);
 		/*! Sound file: "minute." (def. queue-minute) */
@@ -1966,7 +1971,8 @@ struct call_queue {
 	unsigned int reportholdtime:1;
 	unsigned int wrapped:1;
 	unsigned int timeoutrestart:1;
-	unsigned int announceholdtime:2;
+	unsigned int announceholdtime:3;
+	unsigned int announcehold_only_down:1; /*!< Only announce hold time if it has improved */
 	unsigned int announceposition:3;
 	unsigned int announceposition_only_up:1; /*!< Only announce position if it has improved */
 	int strategy:4;
@@ -1977,6 +1983,7 @@ struct call_queue {
 	unsigned int autopauseunavail:1;
 	enum empty_conditions joinempty;
 	enum empty_conditions leavewhenempty;
+	int announceholdlimit;              /*!< How long hold we announce? */
 	int announcepositionlimit;          /*!< How many positions we announce? */
 	int announcefrequency;              /*!< How often to announce their position */
 	int minannouncefrequency;           /*!< The minimum number of seconds between position announcements (def. 15) */
@@ -3097,6 +3104,8 @@ static void init_queue(struct call_queue *q)
 	q->announcefrequency = 0;
 	q->minannouncefrequency = DEFAULT_MIN_ANNOUNCE_FREQUENCY;
 	q->announceholdtime = 1;
+	q->announcehold_only_down = 0;
+	q->announceholdlimit = 60; /* Default 60 minutes */
 	q->announceposition_only_up = 0;
 	q->announcepositionlimit = 10; /* Default 10 positions */
 	q->announceposition = ANNOUNCEPOSITION_YES; /* Default yes */
@@ -3146,6 +3155,7 @@ static void init_queue(struct call_queue *q)
 	ast_string_field_set(q, queue_quantity1, "queue-quantity1");
 	ast_string_field_set(q, queue_quantity2, "queue-quantity2");
 	ast_string_field_set(q, sound_holdtime, "queue-holdtime");
+	ast_string_field_set(q, sound_morethan, "queue-morethan");
 	ast_string_field_set(q, sound_minutes, "queue-minutes");
 	ast_string_field_set(q, sound_minute, "queue-minute");
 	ast_string_field_set(q, sound_seconds, "queue-seconds");
@@ -3515,6 +3525,8 @@ static void queue_set_param(struct call_queue *q, const char *param, const char 
 		ast_string_field_set(q, queue_quantity2, val);
 	} else if (!strcasecmp(param, "queue-holdtime")) {
 		ast_string_field_set(q, sound_holdtime, val);
+	} else if (!strcasecmp(param, "queue-morethan")) {
+		ast_string_field_set(q, sound_morethan, val);
 	} else if (!strcasecmp(param, "queue-minutes")) {
 		ast_string_field_set(q, sound_minutes, val);
 	} else if (!strcasecmp(param, "queue-minute")) {
@@ -3552,11 +3564,19 @@ static void queue_set_param(struct call_queue *q, const char *param, const char 
 	} else if (!strcasecmp(param, "announce-holdtime")) {
 		if (!strcasecmp(val, "once")) {
 			q->announceholdtime = ANNOUNCEHOLDTIME_ONCE;
+		} else if (!strcasecmp(val, "limit")) {
+			q->announceholdtime = ANNOUNCEHOLDTIME_LIMIT;
+		} else if (!strcasecmp(val, "more")) {
+			q->announceholdtime = ANNOUNCEHOLDTIME_MORE_THAN;
 		} else if (ast_true(val)) {
 			q->announceholdtime = ANNOUNCEHOLDTIME_ALWAYS;
 		} else {
 			q->announceholdtime = 0;
 		}
+	} else if (!strcasecmp(param, "announce-holdtime-only-down")) {
+		q->announcehold_only_down = ast_true(val);
+	} else if (!strcasecmp(param, "announce-holdtime-limit")) {
+		q->announceholdlimit = atoi(val);
 	} else if (!strcasecmp(param, "announce-position")) {
 		if (!strcasecmp(val, "limit")) {
 			q->announceposition = ANNOUNCEPOSITION_LIMIT;
@@ -4355,7 +4375,7 @@ static int valid_exit(struct queue_ent *qe, char digit)
 static int say_position(struct queue_ent *qe, int ringing)
 {
 	int res = 0, say_thanks = 0;
-	long avgholdmins, avgholdsecs;
+	long avgholdmins, avgholdsecs, avgholdtime;
 	time_t now;
 
 	/* Let minannouncefrequency seconds pass between the start of each position announcement */
@@ -4420,8 +4440,19 @@ static int say_position(struct queue_ent *qe, int ringing)
 	} else {
 		avgholdsecs = 0;
 	}
+	avgholdtime = avgholdmins*60 + avgholdsecs;
 
 	ast_verb(3, "Hold time for %s is %ld minute(s) %ld seconds\n", qe->parent->name, avgholdmins, avgholdsecs);
+
+	/* Do not announce if the caller's hold time does not improved over last time */
+	if (qe->parent->announcehold_only_down && qe->last_hold_said > 0 && qe->last_hold_said >= avgholdtime) {
+		goto posout;
+	}
+
+	/* Skip holdtime announce in case of limit set */
+	if (qe->parent->announceholdtime == ANNOUNCEHOLDTIME_LIMIT && avgholdtime > qe->parent->announceholdlimit) {
+		goto posout;
+	}
 
 	/* If the hold time is >1 min, if it's enabled, and if it's not
 	   supposed to be only once and we have already said it, say it */
@@ -4432,6 +4463,17 @@ static int say_position(struct queue_ent *qe, int ringing)
 		res = play_file(qe->chan, qe->parent->sound_holdtime);
 		if (res) {
 			goto playout;
+		}
+		/* If the hold time is more then limit - play additional file and force wait time to limit  */
+		if (qe->parent->announceholdtime == ANNOUNCEHOLDTIME_MORE_THAN) {
+			if (avgholdmins > qe->parent->announceholdlimit) {
+				res = play_file(qe->chan, qe->parent->sound_morethan);
+				if (res) {
+					goto playout;
+				}
+				avgholdmins = labs(qe->parent->announceholdlimit / 60);
+				avgholdsecs = qe->parent->announceholdlimit - avgholdmins*60;
+			}
 		}
 
 		if (avgholdmins >= 1) {
